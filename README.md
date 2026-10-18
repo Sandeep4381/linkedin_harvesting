@@ -237,6 +237,43 @@ Saved pass URLs restart par reuse hote hain; remaining location searches pehle
 finish hote hain. `--limit 3` ka matlab har variant se up to 3 profiles; combined
 list mein duplicate removal ke baad up to 9 profiles ho sakte hain.
 
+### JD available: Advanced Search first
+
+`.env`: `Advance=true` runs both searches (Advanced first when JD exists, then
+normal). `Advance=false` skips the Advanced pass and runs normal searches only;
+a failed older Advanced pass does not block completion in this mode. Normal
+searches retain their configured title/location and JD filters. Restart after edits.
+`ADVANCED_SEARCH_URL` supplies the Advanced page URL; the older
+`LINKEDIN_ADVANCED_SEARCH_URL` remains a fallback alias. When `Advance` is absent,
+it defaults to true. Already-completed jobs are not reopened by toggling this flag.
+
+When a JD exists, the first pass applies cleaned title, full location, JD-derived skills and years of experience. Each Advanced Search step waits 2 seconds to let selections settle; experience inputs also pause briefly after edits, then Update is clicked before Search. The following normal searches use
+cleaned title + location + the same JD skills/experience. Existing full,
+state/country and country passes remain. Without JD, use title/location only.
+Missing skills/experience are left unset rather than inferred.
+
+`job_history.json` now includes `advanced_search` with its filter signature,
+profile URLs and stage status. Normal pass records also include `filters`.
+Successful searches with unchanged filters are reused after restart. Failed
+Advanced Search is recorded; normal passes are still attempted. A failed required
+stage leaves the job pending instead of claiming the search completed.
+
+All passes finish before candidate extraction. Advanced and normal URLs merge
+and deduplicate; `--limit` applies to each pass. New behavior applies to pending
+and new jobs, not jobs already marked completed.
+
+`linkedin_search.py` owns `run_advanced_search()` (full Advanced Search pass, cache, URLs and errors), UI filter helpers and explicit experience-range mapping. `recruit_manual.process_job()` calls this separate function before normal searches.
+The Years of experience editor opens, fills its From/to fields, verifies their values, and clicks Update before Search. A minimum such as 5+ sets From=5, to=30 (the UI means 30+); a 3-7 range sets From=3, to=7. Simple stated year ranges/minimums map automatically; ambiguous/complex or
+preferred-only experience is not guessed and is recorded as a filter error.
+Live Recruiter controls may vary. Optional settings in `recruit.env.example`:
+`LINKEDIN_ADVANCED_SEARCH_URL`, `LINKEDIN_SKILLS_SELECTOR`,
+`LINKEDIN_EXPERIENCE_MIN_SELECTOR`, `LINKEDIN_EXPERIENCE_MAX_SELECTOR`,
+`LINKEDIN_SEARCH_SUBMIT_SELECTOR`. Skill filters use AND between the supplied
+skills. Filters must apply successfully before a pass is recorded as collected.
+
+Offline checks: `python -m unittest discover -s tests -v`. These mock browser/DB
+operations and verify search order, merging, restart caching and failure handling.
+Live Advanced Search controls still need verification in an authenticated session.
 ## 6. Profile extraction, duplicate checks aur resume
 
 1. Cached public URL ho to profile kholne se pehle MySQL duplicate check.
@@ -423,7 +460,7 @@ profile extraction, geography result/fallback, PDF, DB check, upload, required
 fields, pre-save checks, Save confirmation and tagging. Logs include candidate
 data, so handle captured terminal output accordingly.
 
-Current workspace mein automated test suite present nahi hai. Use `--jobs-only --jobs-limit 1`
+Offline search workflow tests are available under `tests/`. Use `--jobs-only --jobs-limit 1`
 and `--search-only --limit 3` for limited checks, then a deliberately limited
 real applicant run. End-to-end selectors and Save/tagging still require a live session.
 
@@ -557,3 +594,10 @@ Replace `JOB_ID` with a real accessible job. Jobs-only calls AI, even though its
 CLI help has an older description. Both limited modes write local state, and
 startup cleanup applies to all modes. Normal mode saves real Ceipal applicants.
 `--jobs-limit` does not cap cached backlog; use `--job-url` for a specific job.
+Title/location entry: the exact text is copied to the browser clipboard and pasted with Ctrl+V, then Tab moves focus away. No suggestion clicks, Enter submission, or post-paste value/token verification occurs. Title retains the two-second page-load wait. Keyboard shortcuts use page.keyboard to avoid stale-locator timeouts if the input rerenders after paste.
+
+Current search sequence: title stays direct paste without suggestion/token checks; location uses Ctrl+V, waits for suggestions, and clicks the first visible location-owned suggestion (no token verification). Skills finish before a two-second wait; the Years of experience trigger button opens the editor, From/to are filled, Update is clicked, then Search is clicked with a two-second wait before result processing.
+
+Advanced Search uses exactly one location from location_details.full_location (e.g. Canada). For older caches without that field, it falls back to AI-final/job location. Broader location variants belong only to normal searches.
+
+Experience live regression (2026-10-18): clicking the wide trigger button centre left aria-expanded=false. The code now hovers the plus icon, clicks the visible Years of experience label, retries only while collapsed, and uses the actual range-from/range-to form fields. Tested in an isolated copy of the authenticated LinkedIn session: From=3/to=5, Update, Search and results-page load succeeded. No applicant records or original browser profile were modified by this test.

@@ -3053,6 +3053,12 @@ async def process_candidate_profiles(api, args, profile_page, applicant_page, jo
 
 
 async def process_job(api, args, linkedin, profile_page, applicant_page, job, profiles, history, history_path, persist):
+    from linkedin_search import (
+        job_search_requirements, run_advanced_search, apply_jd_filters, submit_search, clear_search_filters, advanced_search_enabled
+    )
+
+    requirements = job_search_requirements(job)
+    advanced_required = requirements["has_jd"] and advanced_search_enabled()
     code = job["code"]
     final_location = job.get("ai_final_location") or job
     final_country = final_location.get("country") or (job.get("location_details") or {}).get("country")
@@ -3094,8 +3100,19 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
             "LinkedIn search was not started."
         )
 
+    # Advanced Search has exactly one full-location pass, independent of normal variants.
+    advanced_location = " ".join(str(
+        (job.get("location_details") or {}).get("full_location")
+        or (job.get("ai_final_location") or {}).get("location")
+        or job.get("location") or source_location
+    ).split())
+    advanced, advanced_urls = await run_advanced_search(
+        api, args, linkedin, code, advanced_location, requirements, saved_job,
+        lambda: api.save_state(history_path, history),
+        title=job.get("cleaned_title") or job["title"],
+    )
     location_searches = saved_job.setdefault("location_searches", [])
-    all_urls = []
+    all_urls = list(advanced_urls)
     for record in location_searches:
         all_urls.extend(record.get("profiles", []))
 
@@ -3104,34 +3121,49 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         all_urls.extend(legacy_urls)
 
     search_title = job.get("cleaned_title") or job["title"]
-    search_only_urls = []
+    search_only_urls = list(advanced_urls)
+    normal_filters = dict(title=search_title, skills=requirements["skills"],
+                          experience=requirements["experience"], version=1)
     for pass_number, variant in enumerate(location_variants, start=1):
         record = next(
             (item for item in location_searches if item.get("pass") == pass_number),
             None,
         )
-        if record and record.get("location") == variant and record.get("status") == "completed" and not args.search_only:
+        if record and record.get("filters") == normal_filters and record.get("location") == variant and record.get("status") == "completed" and not args.search_only:
             search_only_urls.extend(record.get("profiles", []))
             continue
 
         if args.search_only:
             candidates = None
-        elif record and record.get("location") == variant and (
+        elif record and record.get("filters") == normal_filters and record.get("location") == variant and (
             record.get("status") in {"processing", "collected", "completed"}
             or record.get("search_status") == "completed"
         ):
             candidates = record.get("profiles", [])
-        elif pass_number == 1 and legacy_urls:
+        elif pass_number == 1 and legacy_urls and not requirements["has_jd"]:
             candidates = legacy_urls
         else:
             candidates = None
 
         if candidates is None:
-            await linkedin.goto(api.SEARCH_URL, wait_until="domcontentloaded")
-            await api.apply_title(linkedin, search_title)
-            await api.apply_location(linkedin, variant)
-            await api.wait_for_search_results(linkedin)
-            candidates = await api.collect_profiles(linkedin, args.limit)
+            try:
+                await linkedin.goto(api.SEARCH_URL, wait_until="domcontentloaded")
+                await clear_search_filters(linkedin)
+                await api.apply_title(linkedin, search_title)
+                await api.apply_location(linkedin, variant)
+                if requirements["has_jd"]:
+                    await apply_jd_filters(linkedin, requirements)
+                await submit_search(linkedin, required=requirements["has_jd"])
+                await api.wait_for_search_results(linkedin)
+                candidates = await api.collect_profiles(linkedin, args.limit)
+            except Exception as exc:
+                if record is None:
+                    record = {"pass": pass_number, "location": variant, "profiles": []}
+                    location_searches.append(record)
+                record.update(filters=normal_filters, search_status="failed", status="failed", error=str(exc))
+                api.save_state(history_path, history)
+                print(f"Job {code}: title search pass {pass_number} failed: {exc}; continuing.", flush=True)
+                continue
 
         print(
             f"Job {code}: location search pass {pass_number} using {variant!r} "
@@ -3142,6 +3174,8 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         if record is None:
             record = {"pass": pass_number, "location": variant}
             location_searches.append(record)
+        record["filters"] = normal_filters
+        record.pop("error", None)
         record["location"] = variant
         record["profiles"] = candidates
         record["search_status"] = "completed"
@@ -3188,12 +3222,21 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         api, args, profile_page, applicant_page, job, unique_urls, profiles, persist
     )
     for record in location_searches:
+        if record.get("search_status") != "completed":
+            continue
         record["status"] = "completed" if all(
             profiles.get(url, {}).get("status") in FINAL for url in record.get("profiles", [])
         ) else "processing"
     api.save_state(history_path, history)
 
+    if advanced and advanced.get("search_status") == "completed":
+        advanced["status"] = "completed" if all(
+            profiles.get(url, {}).get("status") in FINAL for url in advanced_urls
+        ) else "processing"
+
     completed_all = (
+        (not advanced_required or (advanced and advanced.get("status") == "completed"))
+        and
         all(
             any(item.get("pass") == number and item.get("status") == "completed"
                 for item in location_searches)

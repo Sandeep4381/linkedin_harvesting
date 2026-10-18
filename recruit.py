@@ -414,31 +414,10 @@ async def job_title(page, args):
 
 
 async def apply_title(page, title):
-    print("Applying LinkedIn job title filter: " + title, flush=True)
-    selector = os.getenv("LINKEDIN_JOB_TITLE_SELECTOR")
-    field = page.locator(selector) if selector else page.get_by_role(
-        "combobox", name=re.compile(r"^Job titles?$", re.I))
+    from linkedin_search import apply_job_title
 
-    try:
-        if not selector:
-            await page.get_by_text("Job titles or boolean", exact=True).click()
-            field = page.get_by_placeholder(re.compile("enter a job title or boolean", re.I))
-
-        await field.first.fill(title, timeout=10000)
-        await field.first.press("Enter")
-
-        await page.get_by_role("button", name="Remove " + title, exact=True).wait_for(timeout=15000)
-        await page.mouse.click(200, 200)
-        await asyncio.sleep(1)
-        print("Job title filter applied.", flush=True)
-
-    except Exception:
-        await page.bring_to_front()
-        await prompt(
-            f"In LinkedIn Job titles, select and apply: {title}. "
-            "Remove any previous title/skills filters, click outside, then press Enter."
-        )
-
+    print("Applying LinkedIn job title filter: " + str(title), flush=True)
+    await apply_job_title(page, title)
 
 async def clear_existing_location_filters(page):
     remove_buttons = page.locator('button[aria-label^="Remove "]')
@@ -457,41 +436,11 @@ async def clear_existing_location_filters(page):
 
 
 async def apply_location(page, location):
-    location = " ".join(str(location or "").split())
-    if not location:
-        raise ValueError(
-            "No job location was found. Supply --location or fix the Ceipal job "
-            "location so LinkedIn search does not start without its location filter."
-        )
+    from linkedin_search import apply_location_paste
 
-    print("Applying LinkedIn location filter: " + location, flush=True)
-    selector = os.getenv("LINKEDIN_LOCATION_SELECTOR")
-    field = page.locator(selector) if selector else page.get_by_role(
-        "combobox", name=re.compile(r"^Locations?$", re.I)
-    )
-
-    try:
-        if not selector:
-            await page.get_by_text("Candidate geographic locations", exact=True).click()
-            field = page.get_by_placeholder(re.compile("enter a location", re.I))
-
-        await clear_existing_location_filters(page)
-        await field.first.fill("")
-        await field.first.fill(location, timeout=10000)
-        await asyncio.sleep(2)
-        first_option = page.locator('[role="option"]:visible').first
-        await first_option.wait_for(state="visible", timeout=5000)
-        await first_option.click()
-        print("Location filter applied using first suggestion.", flush=True)
-
-    except Exception:
-        await page.bring_to_front()
-        await prompt(
-            f"In LinkedIn Locations, remove old location filters, type and apply: {location}. "
-            "Wait for suggestions and click the first option, then press Enter."
-        )
-
-
+    print("Applying LinkedIn location filter: " + str(location), flush=True)
+    await clear_existing_location_filters(page)
+    await apply_location_paste(page, location)
 
 def _unique_nonempty(values):
     out = []
