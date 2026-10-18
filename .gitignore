@@ -2,3 +2,17 @@
 
 # Chrome profile with live LinkedIn/Ceipal session cookies and saved logins
 browser-data-recruit/
+
+# Local secrets and environments
+.env
+.env.*
+!.env.example
+.venv/
+
+# Generated runtime files
+__pycache__/
+*.py[cod]
+resumes/
+extract_job.json
+job_history.json
+profile_data.json
