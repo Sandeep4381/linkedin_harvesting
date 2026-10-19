@@ -9,6 +9,12 @@ primary guide hai. `.docs/` ke older documents mein previous flow bhi described 
 
 ## Developer quick orientation
 
+Per job processing limit: Advanced Search max 10 unique profiles; normal search
+max 30 unique profiles across all location passes. Overlap Advanced Search mein
+count hota hai. `job_history.json` mein `profile_sources` har URL ka source batata
+hai; `profile_selection` selected URLs, `skipped_normal_limit` aur limits rakhta hai.
+Limit se bahar normal profiles ke resumes/upload process nahi hote.
+
 This guide uses simple Hinglish. Suggested code reading order:
 `recruit.py` -> `recruit_manual.py` -> `recruiting_ai.py` -> `azure_title.py`.
 Location issues ke liye `profile_location.py`; shared selectors ke liye `main.py` dekho.
@@ -45,6 +51,19 @@ inside `run`) ready jobs process karta hai. Dono asyncio tasks hain. New analysi
 aur LinkedIn processing overlap ho sakte hain; consumer one job at a time aur
 candidate loop one profile at a time process karta hai. Selected blocking AI,
 DB aur geography calls `asyncio.to_thread()` se run hote hain.
+
+Resume/applicant pipeline: PDF ready hote hi single Ceipal worker uska upload,
+Save aur eligible job tagging karta hai. Saath mein next profile ki extraction
+aur PDF preparation chalti hai. Ceipal worker applicants sequentially process
+karta hai; job completion se pehle saare queued PDFs finish hone ka wait hota hai.
+Ek applicant fail ho to next queued applicant continue hota hai. Stop/restart par
+tracked pending PDFs existing startup retry flow se process hote hain.
+
+AI quota/rate limit par same request wait karke retry hoti hai; profile skip nahi
+hoti. Provider ka `Retry-After` follow hota hai; header absent ho to wait 60 seconds
+se exponentially badhkar max 10 minutes per retry hota hai. Quota available hone
+tak retry chalta hai. AI calls worker thread mein wait karti hain, isliye already
+ready resume ka Ceipal upload/Save/tag parallel continue hota hai.
 
 Browser tabs: Ceipal jobs, LinkedIn search, candidate profile, Ceipal applicant.
 Saved session `browser-data-recruit/` mein rehti hai.
@@ -324,7 +343,10 @@ Main functions: `create_applicant()`, `ensure_applicant_field()`,
    city/state/country AI se dobara check hote hain. Failure par Save nahi hoti aur
    failure is recorded, generated PDF is deleted, and the next profile continues. First/Last Name checks nahi hote; blank email/mobile dummy values se fill hote hain.
 9. Save click ke baad applicant snapshot URL ya duplicate response verify hota hai.
-10. Save confirmed ho to DB tracking update aur Quick Tag mein job code tag hota hai.
+10. Save confirmed ho to DB tracking update hota hai. Quick Tag sirf us job ke
+    successful Advanced Search se collected profile ko lagta hai; normal search
+    profiles sirf save hoti hain (`skipped_not_advanced_search`). Per-job source
+    `advanced_search_job_codes` mein restart ke liye preserve hota hai.
     Tag failure separately record hoti hai; saved applicant automatically undo nahi hota.
 
 Per-profile errors do not terminate the run. Failed attempts become `skipped_processing_failed`; their local PDF is deleted and the next profile proceeds. Successful Save/duplicate paths also clean up local PDFs. A confirmed saved record remains saved if a later tracking operation fails.

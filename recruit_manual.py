@@ -1396,6 +1396,20 @@ async def ensure_applicant_field(page, selectors, label_pattern, fallback, field
 
 
 async def create_applicant(page, row, api, persist, job_code=None):
+    raw = row.get("raw") or {}
+    header = "\n".join(raw.get("public_sections") or []).strip().splitlines()
+    names = [raw.get("name"), header[0] if header else "",
+             (row.get("profile") or {}).get("name")]
+    if (is_linkedin_member_profile(row.get("profile") or {}) or any(
+        " ".join(str(name or "").split()).casefold() == "linkedin member"
+        for name in names
+    )):
+        row["status"] = "skipped_linkedin_member"
+        row["tag_job_status"] = "skipped_linkedin_member"
+        persist()
+        print(f"LinkedIn Member profile: resume upload/save skipped for {row['url']}", flush=True)
+        return
+
     def progress(message):
         print(f"[Ceipal | job={job_code} | profile={row['url']}] {message}", flush=True)
 
@@ -1547,11 +1561,15 @@ async def create_applicant(page, row, api, persist, job_code=None):
                     update_job_processing_status(job_code, 1)
 
                 try:
-                    progress("Save confirmed; waiting 5 seconds before Quick Tag...")
-                    await asyncio.sleep(5)
-                    progress(f"Tagging saved applicant to job {job_code}...")
-                    tagged = await quick_tag_job(page, job_code)
-                    row["tag_job_status"] = "tagged" if tagged else "tag_failed_or_skipped"
+                    if job_code in (row.get("advanced_search_job_codes") or []):
+                        progress("Save confirmed; waiting 5 seconds before Quick Tag...")
+                        await asyncio.sleep(5)
+                        progress(f"Tagging Advanced Search applicant to job {job_code}...")
+                        tagged = await quick_tag_job(page, job_code)
+                        row["tag_job_status"] = "tagged" if tagged else "tag_failed_or_skipped"
+                    else:
+                        row["tag_job_status"] = "skipped_not_advanced_search"
+                        progress("Applicant saved; job tag skipped: not from this job's Advanced Search.")
                     persist()
                     progress(f"Job tagging result: {row['tag_job_status']}")
                 except Exception as exc:
@@ -2682,7 +2700,7 @@ async def run(api, args):
         # Extracted candidate content stays in memory for PDF creation only.
         tracking_fields = {
             "url", "public_url", "status", "job_codes", "extraction_version",
-            "resume_path", "resume_deleted", "applicant_url", "tag_job_status",
+            "resume_path", "resume_deleted", "applicant_url", "tag_job_status", "advanced_search_job_codes",
             "city", "state", "country", "location", "location_source",
             "location_validation", "city_location_validated",
             "business_unit", "job_index", "job_title", "cleaned_job_title", "date_posted", "error",
@@ -2832,6 +2850,44 @@ async def run(api, args):
 
 
 async def process_candidate_profiles(api, args, profile_page, applicant_page, job, urls, profiles, persist):
+    """Build the next PDF while one worker uploads/saves/tags ready PDFs."""
+    ready = asyncio.Queue()
+
+    async def upload_ready():
+        while True:
+            row = await ready.get()
+            try:
+                if row is None:
+                    return
+                try:
+                    await create_applicant(applicant_page, row, api, persist, job["code"])
+                    row.pop("error", None)
+                    persist()
+                    print(f"[Profile {row['url']}] Applicant result: {row.get('status')}", flush=True)
+                except Exception as exc:
+                    if row.get("status") in {"saved", "duplicate", "skipped_db_exists"}:
+                        row["error"] = str(exc)
+                        persist()
+                    else:
+                        skip_failed_profile(api, row, exc, persist)
+            finally:
+                ready.task_done()
+
+    worker = asyncio.create_task(upload_ready())
+    try:
+        await prepare_candidate_profiles(
+            api, args, profile_page, applicant_page, job, urls, profiles, persist, ready
+        )
+        await ready.put(None)
+        await worker
+    finally:
+        if not worker.done():
+            worker.cancel()
+        await asyncio.gather(worker, return_exceptions=True)
+    return all(profiles.get(url, {}).get("status") in FINAL for url in urls)
+
+
+async def prepare_candidate_profiles(api, args, profile_page, applicant_page, job, urls, profiles, persist, ready):
     from recruiting_ai import build_ai_resume_profile
 
     code = job["code"]
@@ -3009,17 +3065,12 @@ async def process_candidate_profiles(api, args, profile_page, applicant_page, jo
                 )
                 continue
 
-            try:
-                await create_applicant(applicant_page, row, api, persist, code)
-            except TypeError as exc:
-                if "positional arguments" not in str(exc):
-                    raise
-                await create_applicant(applicant_page, row, api, persist)
-
             row.pop("error", None)
+            row["status"] = "resume_ready"
             profiles[url] = row
             persist()
-            print(f"[Profile {url}] Processing result: {row.get('status')}; moving to next profile.", flush=True)
+            await ready.put(row)
+            print(f"[Profile {url}] PDF queued for Ceipal; preparing next profile in parallel.", flush=True)
 
         except ExistingProfileSkipped as exc:
             row["status"] = "skipped_db_exists"
@@ -3155,7 +3206,7 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
                     await apply_jd_filters(linkedin, requirements)
                 await submit_search(linkedin, required=requirements["has_jd"])
                 await api.wait_for_search_results(linkedin)
-                candidates = await api.collect_profiles(linkedin, args.limit)
+                candidates = await api.collect_profiles(linkedin, 30)
             except Exception as exc:
                 if record is None:
                     record = {"pass": pass_number, "location": variant, "profiles": []}
@@ -3194,8 +3245,38 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
 
         print(f"Job {code}: pass {pass_number} URLs stored; continuing to next location before profile extraction.", flush=True)
 
+    advanced_urls = list(dict.fromkeys(advanced_urls))[:10]
+    advanced_set = set(advanced_urls)
+    all_advanced_set = set((advanced or {}).get("profiles", [])) | advanced_set
+    normal_urls = list(dict.fromkeys(url for url in all_urls if url not in all_advanced_set))
+    selected_normal = normal_urls[:30]
+    selected_urls = advanced_urls + selected_normal
+    selected_set = set(selected_urls)
+    saved_job["profile_sources"] = {
+        url: "advanced_search" if url in all_advanced_set else "normal_search"
+        for url in list(dict.fromkeys(all_urls))
+    }
+    saved_job["profile_selection"] = {
+        "advanced_search": advanced_urls,
+        "normal_search": selected_normal,
+        "skipped_normal_limit": normal_urls[30:],
+        "skipped_advanced_limit": list(dict.fromkeys(
+            url for url in (advanced or {}).get("profiles", []) if url not in advanced_set
+        )),
+        "limits": {"advanced_search": 10, "normal_search": 30},
+    }
+    for record in location_searches:
+        record["source"] = "normal_search"
+        record["skipped_limit_profiles"] = [url for url in record.get("profiles", []) if url not in selected_set]
+    if advanced:
+        advanced["source"] = "advanced_search"
+        advanced["skipped_limit_profiles"] = [
+            url for url in advanced.get("profiles", []) if url not in advanced_set
+        ]
+        advanced["profiles"] = advanced_urls
+
     if args.search_only:
-        saved_job["profiles"] = list(dict.fromkeys(search_only_urls))
+        saved_job["profiles"] = selected_urls
         saved_job["search_status"] = "completed"
         api.save_state(history_path, history)
         print(
@@ -3205,7 +3286,7 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         )
         return
 
-    unique_urls = list(dict.fromkeys(all_urls))
+    unique_urls = selected_urls
     saved_job["profiles"] = unique_urls
     saved_job["search_status"] = "completed"
     api.save_state(history_path, history)
@@ -3218,6 +3299,15 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         raise ValueError("No LinkedIn profiles found in any location search pass; job remains pending.")
 
     print(f"Job {code}: all {len(location_variants)} location searches finished; processing {len(unique_urls)} unique profiles.", flush=True)
+    verified_advanced_urls = set(advanced_urls) if advanced and advanced.get("search_status") == "completed" else set()
+    for url in unique_urls:
+        row = profiles.setdefault(url, {"url": url, "status": "pending", "job_codes": []})
+        sources = row.setdefault("advanced_search_job_codes", [])
+        if code in sources:
+            sources.remove(code)
+        if url in verified_advanced_urls:
+            sources.append(code)
+    persist()
     await process_candidate_profiles(
         api, args, profile_page, applicant_page, job, unique_urls, profiles, persist
     )
@@ -3225,7 +3315,8 @@ async def process_job(api, args, linkedin, profile_page, applicant_page, job, pr
         if record.get("search_status") != "completed":
             continue
         record["status"] = "completed" if all(
-            profiles.get(url, {}).get("status") in FINAL for url in record.get("profiles", [])
+            profiles.get(url, {}).get("status") in FINAL
+            for url in record.get("profiles", []) if url in selected_set
         ) else "processing"
     api.save_state(history_path, history)
 

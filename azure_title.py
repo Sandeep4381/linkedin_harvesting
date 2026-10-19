@@ -2,10 +2,47 @@ import os
 import json
 import time
 import requests
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 5
 REQUEST_TIMEOUT_SECONDS = 1000
+
+
+def _post_waiting_for_quota(*args, **kwargs):
+    """Keep the same AI request pending until provider quota is available."""
+    delay = 60.0
+    while True:
+        response = requests.post(*args, **kwargs)
+        quota = response.status_code == 429 or (
+            response.status_code in (402, 403)
+            and any(term in response.text.casefold()
+                    for term in ("quota", "rate limit", "ratelimit", "resource_exhausted"))
+        )
+        if not quota:
+            return response
+        wait = delay
+        retry_after = response.headers.get("Retry-After")
+        if retry_after:
+            try:
+                wait = max(1.0, float(retry_after))
+            except ValueError:
+                try:
+                    reset = parsedate_to_datetime(retry_after)
+                    if reset.tzinfo is None:
+                        reset = reset.replace(tzinfo=timezone.utc)
+                    wait = max(1.0, (reset - datetime.now(timezone.utc)).total_seconds())
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        response.close()
+        print(f"AI quota/rate limit reached; waiting {wait:.0f}s before retrying the same request.", flush=True)
+        remaining = wait
+        while remaining > 0:
+            pause = min(remaining, 60)
+            time.sleep(pause)
+            remaining -= pause
+        delay = min(delay * 2, 600)
 
 
 def _post_with_retry(body: dict) -> dict:
@@ -24,7 +61,7 @@ def _post_azure(body: dict) -> dict:
     if not endpoint or not key:
         raise ValueError("Azure requires AZURE_AI_ENDPOINT and AZURE_AI_API_KEY in .env")
     for attempt in range(1, MAX_RETRIES + 1):
-        response = requests.post(
+        response = _post_waiting_for_quota(
             endpoint, json=body,
             headers={"Content-Type": "application/json", "api-key": key},
             timeout=REQUEST_TIMEOUT_SECONDS,
@@ -59,7 +96,7 @@ def _post_ollama(body: dict) -> dict:
         payload["format"] = "json"
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            response = requests.post(endpoint, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
+            response = _post_waiting_for_quota(endpoint, json=payload, timeout=REQUEST_TIMEOUT_SECONDS)
             response.raise_for_status()
             data = response.json()
             if data.get("done_reason") == "length":

@@ -268,7 +268,7 @@ async def run_advanced_search(api, args, linkedin, code, source_location, requir
         advanced = saved_job.get("advanced_search") or {}
         if (not args.search_only and advanced.get("filters") == signature
                 and advanced.get("search_status") == "completed"):
-            advanced_urls = advanced.get("profiles", [])
+            advanced_urls = advanced.get("profiles", [])[:10]
             print(f"Job {code}: reusing Advanced Search URLs.", flush=True)
         else:
             advanced = dict(filters=signature, status="pending", profiles=[])
@@ -288,7 +288,7 @@ async def run_advanced_search(api, args, linkedin, code, source_location, requir
                 await wait_for_filter_step("filters ready before Search")
                 await submit_search(linkedin, required=True)
                 await api.wait_for_search_results(linkedin)
-                advanced_urls = await api.collect_profiles(linkedin, args.limit)
+                advanced_urls = (await api.collect_profiles(linkedin, 10))[:10]
                 advanced.update(profiles=advanced_urls, search_status="completed", status="collected")
                 print(f"Job {code}: Advanced Search collected {len(advanced_urls)} profiles; starting title searches.", flush=True)
             except Exception as exc:
